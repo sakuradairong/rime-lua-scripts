@@ -14,10 +14,14 @@ if not ok then
 end
 
 -- 测试用导出
-local utf8_last       = rcf.utf8_last
-local serialize       = rcf.serialize
-local decay_learned   = rcf.decay_learned
+local utf8_last        = rcf.utf8_last
+local utf8_char_count  = rcf.utf8_char_count
+local serialize        = rcf.serialize
+local load_data        = rcf.load_data
+local save             = rcf.save
+local decay_learned    = rcf.decay_learned
 local score_candidates = rcf.score_candidates
+local do_save          = rcf.do_save
 
 ----------------------------------------------------------------------
 -- Assertion helpers
@@ -74,6 +78,19 @@ eq(utf8_last("接下来的", 2), "来的")
 eq(utf8_last("接下来的", 1), "的")
 eq(utf8_last("任务abc", 2), "bc")
 eq(utf8_last("任务abc", 4), "务abc")
+io.write("  passed\n")
+
+----------------------------------------------------------------------
+-- 1b. utf8_char_count
+----------------------------------------------------------------------
+
+io.write("=== utf8_char_count ===\n")
+eq(utf8_char_count(""), 0)
+eq(utf8_char_count("a"), 1)
+eq(utf8_char_count("hello"), 5)
+eq(utf8_char_count("任务"), 2)
+eq(utf8_char_count("任务abc"), 5)
+eq(utf8_char_count("接下来的"), 4)
 io.write("  passed\n")
 
 ----------------------------------------------------------------------
@@ -231,6 +248,96 @@ score_candidates(cands{"任务"}, {"接下来的"}, {
   ["的"]       = { ["任务"] = 8 },  -- weight 0.25 => 2
 }, s)
 near(s["任务"], 7.0, 0.01, "3 + 2 + 2 = 7")
+
+io.write("  passed\n")
+
+----------------------------------------------------------------------
+-- 7. load_data / save 往返
+----------------------------------------------------------------------
+
+io.write("=== load_data / save roundtrip ===\n")
+
+local tmp_file = os.tmpname()
+local sample = {
+  ["接下来的"] = { ["任务"] = 8, ["工作"] = 3 },
+  ["完成"]     = { ["任务"] = 5 },
+}
+check(save(sample, tmp_file), "save succeeds")
+local loaded = load_data(tmp_file)
+eq(loaded["接下来的"]["任务"], 8)
+eq(loaded["接下来的"]["工作"], 3)
+eq(loaded["完成"]["任务"], 5)
+os.remove(tmp_file)
+
+-- 损坏文件应安全返回空表
+local bad_file = os.tmpname()
+local bf = io.open(bad_file, "w")
+bf:write("not valid lua!!!")
+bf:close()
+check(next(load_data(bad_file)) == nil, "corrupt file => empty table")
+os.remove(bad_file)
+
+io.write("  passed\n")
+
+----------------------------------------------------------------------
+-- 8. 学习计数不重复累加
+----------------------------------------------------------------------
+
+io.write("=== learning count (no double-count) ===\n")
+
+do
+  local learned = {}
+  for _ = 1, 5 do
+    local prev, text = "接下来的", "任务"
+    local e = learned[prev]
+    if e then
+      e[text] = (e[text] or 0) + 1
+    else
+      learned[prev] = { [text] = 1 }
+    end
+  end
+  eq(learned["接下来的"]["任务"], 5, "5 commits => count 5, not 10")
+end
+
+io.write("  passed\n")
+
+----------------------------------------------------------------------
+-- 9. do_save 刷盘与衰减
+----------------------------------------------------------------------
+
+io.write("=== do_save ===\n")
+
+do
+  local tmp = os.tmpname()
+  local env = {
+    learned = { ["前文"] = { ["词"] = 10, ["将消亡"] = 1 } },
+    data_file = tmp,
+    decay_enabled = true,
+    decay_rate = 0.95,
+    commit_count = 3,
+  }
+  do_save(env, true)
+  eq(env.commit_count, 0, "commit_count reset after save")
+  local reloaded = load_data(tmp)
+  near(reloaded["前文"]["词"], 9.5, 0.01, "decay applied on periodic save")
+  eq(reloaded["前文"]["将消亡"], nil, "low count pruned by decay before serialize")
+  os.remove(tmp)
+end
+
+do
+  local tmp = os.tmpname()
+  local env = {
+    learned = { ["前文"] = { ["词"] = 10 } },
+    data_file = tmp,
+    decay_enabled = true,
+    decay_rate = 0.95,
+    commit_count = 2,
+  }
+  do_save(env, false)
+  local reloaded = load_data(tmp)
+  eq(reloaded["前文"]["词"], 10, "fini flush skips decay")
+  os.remove(tmp)
+end
 
 io.write("  passed\n")
 
