@@ -88,20 +88,20 @@ end
 
 --- 用 Lua VM 原生加载数据文件（无逐行 regex）
 --- 沙箱环境防止数据文件执行恶意代码
-local function load(data_file)
+local function load_data(data_file)
   local f = io.open(data_file, "r")
-  if not f then return {}, 0 end
+  if not f then return {} end
 
   local content = f:read("*a")
   f:close()
-  if not content or #content == 0 then return {}, 0 end
+  if not content or #content == 0 then return {} end
 
   local safe_env = {}
-  local loader, err
+  local loader
 
   if _VERSION == "Lua 5.1" then
     -- Lua 5.1: load() accepts function only; loadstring for string chunks
-    loader, err = loadstring(content, "@" .. data_file)
+    loader = loadstring(content, "@" .. data_file)
     if loader then
       io.stderr:write("[rime-context-filter] WARNING: " ..
         "Sandbox unavailable on Lua 5.1. " ..
@@ -109,10 +109,10 @@ local function load(data_file)
     end
   else
     -- Lua 5.3+: load(chunk, name, mode, env) with sandbox
-    loader, err = load(content, "@" .. data_file, "t", safe_env)
+    loader = load(content, "@" .. data_file, "t", safe_env)
     if not loader then
       -- Fallback for embedders without 4-arg load
-      loader, err = load(content, "@" .. data_file)
+      loader = load(content, "@" .. data_file)
       if loader then
         io.stderr:write("[rime-context-filter] WARNING: " ..
           "Sandbox unavailable, data file could access global environment.\n")
@@ -120,18 +120,10 @@ local function load(data_file)
     end
   end
 
-  if not loader then return {}, 0 end
+  if not loader then return {} end
   local ok, data = pcall(loader)
-  if not ok or type(data) ~= "table" then return {}, 0 end
-
-  -- 统计总条目数（仅用于 compaction 判断）
-  local entries = 0
-  for _, words in pairs(data) do
-    for _, count in pairs(words) do
-      if count > 1 then entries = entries + 1 end
-    end
-  end
-  return data, entries
+  if not ok or type(data) ~= "table" then return {} end
+  return data
 end
 
 --- 原子重写整个文件
@@ -201,7 +193,7 @@ local function utf8_last(s, n)
   local len = #s
   if len == 0 then return s end
   local pos = len + 1
-  for i = 1, n do
+  for _ = 1, n do
     if pos <= 1 then break end
     pos = pos - 1
     -- 跳过 utf-8 连续字节 (0x80-0xBF)
@@ -211,6 +203,25 @@ local function utf8_last(s, n)
   end
   if pos < 1 then pos = 1 end
   return s:sub(pos)
+end
+
+--- 按 UTF-8 字符计数（非字节）
+local function utf8_char_count(s)
+  local count, i, len = 0, 1, #s
+  while i <= len do
+    local b = s:byte(i)
+    if b < 0x80 then
+      i = i + 1
+    elseif b < 0xE0 then
+      i = i + 2
+    elseif b < 0xF0 then
+      i = i + 3
+    else
+      i = i + 4
+    end
+    count = count + 1
+  end
+  return count
 end
 
 ----------------------------------------------------------------------
@@ -236,8 +247,8 @@ local function score_candidates(candidates, window, learned, scores)
   end
 
   apply_weight(last, 1.0)
-  if #last >= 6 then apply_weight(utf8_last(last, 2), 0.5) end  -- ~2 CJK chars
-  if #last >= 3 then apply_weight(utf8_last(last, 1), 0.25) end -- ~1 CJK char
+  if utf8_char_count(last) >= 2 then apply_weight(utf8_last(last, 2), 0.5) end
+  if utf8_char_count(last) >= 1 then apply_weight(utf8_last(last, 1), 0.25) end
   if #window >= 2 then
     apply_weight(window[#window - 1] .. last, 0.4)
   end
@@ -246,6 +257,14 @@ end
 ----------------------------------------------------------------------
 -- 组件入口
 ----------------------------------------------------------------------
+
+local function do_save(env, with_decay)
+  if with_decay and env.decay_enabled then
+    decay_learned(env.learned, env.decay_rate)
+  end
+  save(env.learned, env.data_file)
+  env.commit_count = 0
+end
 
 local function init(env)
   env.name_space = env.name_space:gsub("^*", "")
@@ -267,11 +286,9 @@ local function init(env)
 
   -- 加载历史数据
   ensure_file(env.data_file)
-  env.learned, env.entry_count = load(env.data_file)
+  env.learned = load_data(env.data_file)
 
-  -- 会话级新增缓冲
   env.scores = {}
-  env.pending = {}
   env.commit_count = 0
 
   -- 监听提交
@@ -281,20 +298,11 @@ local function init(env)
 
     local prev = env.window[#env.window]
     if prev and #prev > 0 then
-      -- 更新内存
       local e = env.learned[prev]
       if e then
         e[text] = (e[text] or 0) + 1
       else
         env.learned[prev] = { [text] = 1 }
-      end
-
-      -- 待刷缓冲
-      local pe = env.pending[prev]
-      if pe then
-        pe[text] = (pe[text] or 0) + 1
-      else
-        env.pending[prev] = { [text] = 1 }
       end
     end
 
@@ -304,31 +312,18 @@ local function init(env)
       table.remove(env.window, 1)
     end
 
-    -- 批量存盘（全量重写，Lua VM 编译加载比逐行 regex 快得多）
+    -- 批量存盘
     env.commit_count = env.commit_count + 1
     if env.commit_count >= env.save_interval then
-      -- 将缓冲合并到 learned
-      for ctx, words in pairs(env.pending) do
-        local e = env.learned[ctx]
-        if not e then
-          env.learned[ctx] = words
-        else
-          for word, count in pairs(words) do
-            e[word] = (e[word] or 0) + count
-          end
-        end
-      end
-      env.pending = {}
-      env.commit_count = 0
-      env.entry_count = nil  -- 下次 compact 时重新计算
-
-      -- 保存前执行衰减
-      if env.decay_enabled then
-        decay_learned(env.learned, env.decay_rate)
-      end
-      save(env.learned, env.data_file)
+      do_save(env, true)
     end
   end)
+end
+
+local function fini(env)
+  if env.commit_count > 0 then
+    do_save(env, false)
+  end
 end
 
 local function filter(input, env)
@@ -367,10 +362,15 @@ end
 
 return {
   init = init,
+  fini = fini,
   func = filter,
   -- 以下仅用于测试
   utf8_last = utf8_last,
+  utf8_char_count = utf8_char_count,
   serialize = serialize,
+  load_data = load_data,
+  save = save,
   decay_learned = decay_learned,
   score_candidates = score_candidates,
+  do_save = do_save,
 }

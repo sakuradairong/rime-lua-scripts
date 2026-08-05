@@ -15,12 +15,11 @@ jobs:
       - name: Install Lua & luarocks
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq lua5.3 luarocks 2>/dev/null
+          sudo apt-get install -y -qq lua5.3 liblua5.3-dev luarocks
       - name: Install luacheck
-        continue-on-error: true
-        run: sudo luarocks install luacheck 2>&1
+        run: sudo luarocks install luacheck
       - name: Lint
-        run: luacheck rime_context_filter.lua --std luacheck --no-max-line-length || true
+        run: luacheck rime_context_filter.lua --no-max-line-length
 
   test:
     name: Test (Lua 5.3)
