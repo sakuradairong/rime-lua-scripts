@@ -235,8 +235,9 @@ local function load_data(data_file)
   local ok, data = pcall(loader)
   if not ok or type(data) ~= "table" then return {}, {} end
 
-  if type(data.data) == "table" then
-    return data.data, (type(data._meta) == "table" and data._meta) or {}
+  -- 必须同时有 _meta 和 data，避免旧文件里恰好有 key「data」时被误判
+  if type(data._meta) == "table" and type(data.data) == "table" then
+    return data.data, data._meta
   end
   -- v5 扁平格式
   local learned = {}
@@ -346,8 +347,57 @@ end
 
 local function clear_pending(env)
   env.pending_tokens = {}
+  env.pending_marks = {}
   env.window_checkpoint = nil
   env._selected = false
+end
+
+local function rebuild_window(env)
+  env.window = copy_window(env.window_checkpoint or {})
+  local pending = env.pending_tokens or {}
+  for i = 1, #pending do
+    push_window(env.window, pending[i], 3)
+  end
+end
+
+--- 退格撤销最近一次 select：弹出 pending 并按 checkpoint 重建窗口。
+local function revert_last_select(env)
+  local pending = env.pending_tokens
+  if not pending or #pending == 0 then return false end
+  pending[#pending] = nil
+  if env.pending_marks then
+    env.pending_marks[#env.pending_marks] = nil
+  end
+  if #pending == 0 then
+    env.window = copy_window(env.window_checkpoint or {})
+    clear_pending(env)
+  else
+    rebuild_window(env)
+  end
+  return true
+end
+
+--- confirmed_count：仍处于 kSelected/kConfirmed 的可学习分段数。
+--- confirmed_pos：segmentation:get_confirmed_position()，与 select 时记下的 mark 比较。
+local function sync_pending(env, confirmed_count, confirmed_pos)
+  local pending = env.pending_tokens
+  if not pending or #pending == 0 then return end
+  if type(confirmed_count) == "number" then
+    while #pending > confirmed_count do
+      revert_last_select(env)
+      pending = env.pending_tokens
+      if not pending or #pending == 0 then return end
+    end
+    return
+  end
+  if type(confirmed_pos) == "number" and env.pending_marks then
+    while #pending > 0 do
+      local mark = env.pending_marks[#env.pending_marks]
+      if not mark or mark <= confirmed_pos then break end
+      revert_last_select(env)
+      pending = env.pending_tokens
+    end
+  end
 end
 
 --- 直接上屏的词（无 select）：过滤后学习并入窗。
@@ -362,14 +412,18 @@ local function on_token(env, text)
 end
 
 --- 组词中确认当前词：立刻更新窗口供下一分段打分，学习推迟到 commit。
-local function on_select(env, text)
+--- confirmed_pos 为可选的 input 已确认长度，用于退格时判断。
+local function on_select(env, text, confirmed_pos)
   env._selected = true
+  env._committed = false
   if not is_learnable(text) then return false end
   env.pending_tokens = env.pending_tokens or {}
+  env.pending_marks = env.pending_marks or {}
   if #env.pending_tokens == 0 then
     env.window_checkpoint = copy_window(env.window)
   end
   env.pending_tokens[#env.pending_tokens + 1] = text
+  env.pending_marks[#env.pending_marks + 1] = confirmed_pos
   push_window(env.window, text, 3)
   return true
 end
@@ -398,6 +452,7 @@ end
 
 --- commit 时若刚发生过 select，把本段组词落成词对；整句本身不再当 token。
 local function on_commit(env, text)
+  env._committed = true
   if env._selected then
     learn_pending(env)
     clear_pending(env)
@@ -406,6 +461,23 @@ local function on_commit(env, text)
   end
   env.commit_count = (env.commit_count or 0) + 1
   return env.commit_count
+end
+
+--- 组词状态变化：Esc 整段取消，或退格撤销部分 select。
+--- composing=false 且尚未 commit 且仍有 pending → 整段回滚。
+--- composing=true 时按 confirmed_count / confirmed_pos 弹出多余 pending。
+local function on_composition_update(env, composing, confirmed_count, confirmed_pos)
+  if env._committed then
+    if composing then env._committed = false end
+    return
+  end
+  if not composing then
+    if env.pending_tokens and #env.pending_tokens > 0 then
+      on_cancel(env)
+    end
+    return
+  end
+  sync_pending(env, confirmed_count, confirmed_pos)
 end
 
 local function selected_text(ctx)
@@ -424,6 +496,35 @@ local function selected_text(ctx)
     end
   end
   return nil
+end
+
+local function get_confirmed_pos(ctx)
+  local ok, pos = pcall(function()
+    return ctx.composition:toSegmentation():get_confirmed_position()
+  end)
+  if ok and type(pos) == "number" then return pos end
+  return nil
+end
+
+local function confirmed_learnable_count(ctx)
+  local ok, segs = pcall(function()
+    local comp = ctx.composition
+    if not comp or comp:empty() then return {} end
+    return comp:toSegmentation():get_segments()
+  end)
+  if not ok or type(segs) ~= "table" then return nil end
+  local n = 0
+  for i = 1, #segs do
+    local seg = segs[i]
+    local st = seg.status
+    if st == "kSelected" or st == "kConfirmed" then
+      local cand = seg.get_selected_candidate and seg:get_selected_candidate()
+      if cand and is_learnable(cand.text) then
+        n = n + 1
+      end
+    end
+  end
+  return n
 end
 
 ----------------------------------------------------------------------
@@ -504,8 +605,11 @@ local function do_save(env)
   elseif not env.decay_at then
     env.decay_at = os.time()
   end
-  save(env.learned, env.data_file, { decay_at = env.decay_at })
-  env.commit_count = 0
+  local ok = save(env.learned, env.data_file, { decay_at = env.decay_at })
+  if ok then
+    env.commit_count = 0
+  end
+  return ok
 end
 
 ----------------------------------------------------------------------
@@ -546,7 +650,9 @@ local function init(env)
   env.commit_count = 0
   env._selected = false
   env.pending_tokens = {}
+  env.pending_marks = {}
   env._in_commit = false
+  env._committed = false
 
   local ctx = env.engine.context
 
@@ -554,7 +660,7 @@ local function init(env)
   env.select_conn = ctx.select_notifier:connect(function(c)
     local ok, text = pcall(selected_text, c)
     if ok and text then
-      on_select(env, text)
+      on_select(env, text, get_confirmed_pos(c))
     end
   end)
 
@@ -571,9 +677,13 @@ local function init(env)
   env.update_conn = ctx.update_notifier:connect(function(c)
     if env._in_commit then return end
     local ok, composing = pcall(function() return c:is_composing() end)
-    if ok and not composing then
-      on_cancel(env)
-    end
+    if not ok then return end
+    on_composition_update(
+      env,
+      composing,
+      confirmed_learnable_count(c),
+      get_confirmed_pos(c)
+    )
   end)
 end
 
@@ -651,6 +761,9 @@ return {
   on_select = on_select,
   on_commit = on_commit,
   on_cancel = on_cancel,
+  on_composition_update = on_composition_update,
+  revert_last_select = revert_last_select,
+  sync_pending = sync_pending,
   do_save = do_save,
   resolve_data_path = resolve_data_path,
 }

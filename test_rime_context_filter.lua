@@ -29,6 +29,9 @@ local on_token           = rcf.on_token
 local on_select          = rcf.on_select
 local on_commit          = rcf.on_commit
 local on_cancel          = rcf.on_cancel
+local on_composition_update = rcf.on_composition_update
+local revert_last_select = rcf.revert_last_select
+local sync_pending       = rcf.sync_pending
 local do_save            = rcf.do_save
 local resolve_data_path  = rcf.resolve_data_path
 
@@ -76,7 +79,9 @@ local function new_env()
     decay_rate = 0.95,
     decay_period = 86400,
     _selected = false,
+    _committed = false,
     pending_tokens = {},
+    pending_marks = {},
     scores = {},
   }
 end
@@ -348,6 +353,17 @@ eq(old_loaded["完成"]["任务"], 5, "legacy format")
 check(old_meta.decay_at == nil, "legacy has no decay_at")
 os.remove(old_file)
 
+-- 旧文件里恰好有 key「data」时不能当成新格式
+local mixed_file = os.tmpname()
+local mf = io.open(mixed_file, "w")
+mf:write('return {["完成"]={["任务"]=5},["data"]={["foo"]=2}}\n')
+mf:close()
+local mixed, mixed_meta = load_data(mixed_file)
+eq(mixed["完成"]["任务"], 5, "legacy with data key keeps 完成")
+eq(mixed["data"]["foo"], 2, "legacy data key kept as context")
+check(mixed_meta.decay_at == nil, "not treated as new format")
+os.remove(mixed_file)
+
 local bad_file = os.tmpname()
 local bf = io.open(bad_file, "w")
 bf:write("not valid lua!!!")
@@ -428,6 +444,59 @@ do
   on_commit(env, "。")
   eq(#env.window, 1, "punct commit after select does not replace window")
   eq(env.window[1], "完成")
+end
+
+do
+  local env = new_env()
+  on_select(env, "接下来的")
+  on_select(env, "任务")
+  check(revert_last_select(env), "revert pops last select")
+  eq(env.window[1], "接下来的", "window after backspace")
+  eq(#env.window, 1)
+  eq(#env.pending_tokens, 1)
+  check(next(env.learned) == nil, "revert does not learn")
+  on_commit(env, "接下来的")
+  eq(env.learned["接下来的"], nil, "single remaining token has no pair")
+end
+
+do
+  local env = new_env()
+  on_select(env, "接下来的")
+  on_select(env, "任务")
+  sync_pending(env, 1)  -- 退格后只剩 1 个已确认分段
+  eq(#env.pending_tokens, 1)
+  eq(env.window[1], "接下来的")
+  eq(env.window[2], nil)
+end
+
+do
+  local env = new_env()
+  on_select(env, "接下来的", 11)
+  on_select(env, "任务", 16)
+  sync_pending(env, nil, 11)  -- confirmed_pos 回到选第一个词之后
+  eq(#env.pending_tokens, 1)
+  eq(env.window[1], "接下来的")
+end
+
+do
+  local env = new_env()
+  on_select(env, "完成")
+  on_select(env, "任务")
+  on_commit(env, "完成任务")
+  eq(env.window[2], "任务")
+  on_composition_update(env, false)  -- 上屏后 composition 清空
+  eq(env.window[1], "完成", "post-commit update does not roll back")
+  eq(env.window[2], "任务")
+  eq(env.learned["完成"]["任务"], 1)
+end
+
+do
+  local env = new_env()
+  on_select(env, "完成")
+  on_select(env, "任务")
+  on_composition_update(env, false)  -- Esc，尚未 commit
+  check(next(env.learned) == nil, "Esc via composition update does not learn")
+  eq(#env.window, 0)
 end
 
 io.write("  passed\n")

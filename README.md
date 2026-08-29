@@ -25,7 +25,7 @@ RIME 输入法上下文调频过滤器。根据组词过程中刚确认的词，
 | `那个` + `renwu` | 任务 1. 人物 2. 任务 | 人物 1. 人物 2. 任务 |
 | `完成` + `renwu` | — | 任务 自动提前 |
 
-一次把整句上屏时，过长的句子不会写入学习数据，避免污染。组词中途按 Esc 取消也不会留下半成品。
+一次把整句上屏时，过长的句子不会写入学习数据，避免污染。组词中途按 Esc 取消、或退格撤销刚确认的词，都不会留下半成品。
 
 ## 安装
 
@@ -148,11 +148,15 @@ return {
 ```
 select_notifier   ← 组词中确认当前词（空格）
   ├─ 过滤：过长整句 / 纯英文 / 标点 / 的了是…
-  ├─ 记录 prev → 当前词
-  └─ 更新上下文窗口（最近 3 个有效词）
+  ├─ 立刻更新上下文窗口（供下一段打分）
+  └─ 词对暂存，等到真正上屏再写入
+
+update_notifier
+  ├─ 退格：按已确认分段数弹出窗口中的半成品
+  └─ Esc：整段回滚，不学习
 
 commit_notifier   ← 文本真正上屏
-  ├─ 若刚 select 过：不再把整句当 token
+  ├─ 把本段词对写入 learned（整句不再当 token）
   └─ 达到 save_interval 则存盘
 ```
 
@@ -187,7 +191,7 @@ commit_notifier   ← 文本真正上屏
 lua test_rime_context_filter.lua
 ```
 
-测试覆盖：分段学习、select/commit 去重、虚词过滤、评分聚合、按日衰减、序列化新旧格式、受限重排、路径解析。
+测试覆盖：分段学习、select/commit 去重、退格回滚、Esc 与上屏后的 composition 更新、虚词过滤、评分聚合、按日衰减、序列化新旧格式（含旧文件带 `data` 键）、受限重排、路径解析。
 
 ### CI
 
@@ -197,7 +201,7 @@ lua test_rime_context_filter.lua
 
 ## 版本历史
 
-- **v6** — 按 select 分段学习（整句不上窗）、`get_user_data_dir` 存盘、notifier 持有 connection、只提前高分候选、虚词不作为 key、按自然日衰减、过滤器放到 uniquifier 之后
+- **v6** — 按 select 分段学习（整句不上窗）、`get_user_data_dir` 存盘、notifier 持有 connection、只提前高分候选、虚词不作为 key、按自然日衰减、过滤器放到 uniquifier 之后；退格回滚窗口、上屏后不误取消、新旧数据格式用 `_meta`+`data` 判定
 - **v5.1** — 修复 Linux 数据路径、UTF-8 按字符截取、Lua 5.3 序列化兼容、scores 表复用减 GC、单元测试 + CI
 - **v5** — 跨平台路径自动检测、衰减遗忘机制、沙箱安全加载、热路径 GC 优化
 - **v4** — Lua 源码持久化格式（移除 JSON 依赖）
