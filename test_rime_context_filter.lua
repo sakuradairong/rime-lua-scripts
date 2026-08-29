@@ -13,15 +13,24 @@ if not ok then
   os.exit(1)
 end
 
--- 测试用导出
-local utf8_last        = rcf.utf8_last
-local utf8_char_count  = rcf.utf8_char_count
-local serialize        = rcf.serialize
-local load_data        = rcf.load_data
-local save             = rcf.save
-local decay_learned    = rcf.decay_learned
-local score_candidates = rcf.score_candidates
-local do_save          = rcf.do_save
+local utf8_last          = rcf.utf8_last
+local utf8_char_count    = rcf.utf8_char_count
+local has_cjk_ideograph  = rcf.has_cjk_ideograph
+local is_learnable       = rcf.is_learnable
+local is_stop_key        = rcf.is_stop_key
+local serialize          = rcf.serialize
+local load_data          = rcf.load_data
+local save               = rcf.save
+local decay_learned      = rcf.decay_learned
+local apply_time_decay   = rcf.apply_time_decay
+local score_candidates   = rcf.score_candidates
+local reorder_batch      = rcf.reorder_batch
+local on_token           = rcf.on_token
+local on_select          = rcf.on_select
+local on_commit          = rcf.on_commit
+local on_cancel          = rcf.on_cancel
+local do_save            = rcf.do_save
+local resolve_data_path  = rcf.resolve_data_path
 
 ----------------------------------------------------------------------
 -- Assertion helpers
@@ -54,12 +63,23 @@ local function near(got, expected, epsilon, msg)
   io.write("    got:       " .. tostring(got) .. "\n")
 end
 
-----------------------------------------------------------------------
--- Mocks
-----------------------------------------------------------------------
-
 local function cand(text) return { text = text } end
 local function cands(texts) local c = {} for i, t in ipairs(texts) do c[i] = cand(t) end return c end
+
+local function new_env()
+  return {
+    learned = {},
+    window = {},
+    commit_count = 0,
+    save_interval = 1000,
+    decay_enabled = false,
+    decay_rate = 0.95,
+    decay_period = 86400,
+    _selected = false,
+    pending_tokens = {},
+    scores = {},
+  }
+end
 
 ----------------------------------------------------------------------
 -- 1. utf8_last
@@ -81,16 +101,37 @@ eq(utf8_last("任务abc", 4), "务abc")
 io.write("  passed\n")
 
 ----------------------------------------------------------------------
--- 1b. utf8_char_count
+-- 1b. utf8_char_count / has_cjk
 ----------------------------------------------------------------------
 
-io.write("=== utf8_char_count ===\n")
+io.write("=== utf8_char_count / has_cjk ===\n")
 eq(utf8_char_count(""), 0)
 eq(utf8_char_count("a"), 1)
 eq(utf8_char_count("hello"), 5)
 eq(utf8_char_count("任务"), 2)
 eq(utf8_char_count("任务abc"), 5)
 eq(utf8_char_count("接下来的"), 4)
+check(has_cjk_ideograph("任务"), "任务 is CJK")
+check(not has_cjk_ideograph("hello"), "hello is not CJK")
+check(not has_cjk_ideograph("。"), "ideographic stop is not ideograph")
+check(not has_cjk_ideograph(""), "empty")
+io.write("  passed\n")
+
+----------------------------------------------------------------------
+-- 1c. is_learnable
+----------------------------------------------------------------------
+
+io.write("=== is_learnable ===\n")
+check(is_learnable("任务"), "word")
+check(is_learnable("接下来的"), "phrase 4 chars")
+check(not is_learnable("的"), "stopword 的")
+check(not is_learnable("了"), "stopword 了")
+check(not is_learnable("hello"), "ascii")
+check(not is_learnable("。"), "punct")
+check(not is_learnable(""), "empty")
+check(not is_learnable("接下来的任务是完成报告"), "too long sentence")
+check(is_stop_key("的"))
+check(not is_stop_key("任务"))
 io.write("  passed\n")
 
 ----------------------------------------------------------------------
@@ -104,12 +145,13 @@ local data = {
   ["完成"]     = { ["任务"] = 5 },
   ["那个"]     = { ["人物"] = 4 },
 }
-local ser = serialize(data)
+local ser = serialize(data, { decay_at = 1700000000 })
 check(type(ser) == "string", "is string")
 check(ser:match("^return%s*{"), "starts with return {")
+check(ser:match("_meta="), "has _meta")
+check(ser:match("data="), "has data")
 check(ser:match("}\n$"), "ends with }\\n")
 
--- 通过 Lua VM 验证语法正确性
 local fn, err
 if _VERSION == "Lua 5.1" then
   fn, err = loadstring(ser)
@@ -121,16 +163,14 @@ if fn then
   local ok2, loaded = pcall(fn)
   check(ok2, "executable")
   if ok2 then
-    eq(loaded["接下来的"]["任务"], 8)
-    eq(loaded["完成"]["任务"], 5)
-    eq(loaded["那个"]["人物"], 4)
+    eq(loaded.data["接下来的"]["任务"], 8)
+    eq(loaded.data["完成"]["任务"], 5)
+    eq(loaded._meta.decay_at, 1700000000)
   end
 end
 
--- 空数据
-local empty_ser = serialize({})
+local empty_ser = serialize({}, { decay_at = 1 })
 check(empty_ser:match("^return {"), "empty starts with return {")
-check(empty_ser:match("}\n$"), "empty ends with }\\n")
 local fn2, err2
 if _VERSION == "Lua 5.1" then
   fn2, err2 = loadstring(empty_ser)
@@ -141,18 +181,17 @@ check(fn2 ~= nil, "empty output is valid Lua (" .. tostring(err2) .. ")")
 if fn2 then
   local ok3, empty_data = pcall(fn2)
   check(ok3 and type(empty_data) == "table")
-  check(next(empty_data) == nil)
+  check(next(empty_data.data) == nil)
 end
 
 io.write("  passed\n")
 
 ----------------------------------------------------------------------
--- 3. decay_learned
+-- 3. decay
 ----------------------------------------------------------------------
 
-io.write("=== decay_learned ===\n")
+io.write("=== decay_learned / apply_time_decay ===\n")
 
--- 高频保留，极低频清除
 do
   local d = { ["前文"] = { ["高频词"] = 50, ["将消亡"] = 1 } }
   decay_learned(d, 0.95)
@@ -160,18 +199,41 @@ do
   eq(d["前文"]["将消亡"], nil, "count 1 * 0.95 < 1.1 → nil")
 end
 
--- 空表清除
 do
   local d2 = { ["前文"] = { ["孤例"] = 1 } }
   decay_learned(d2, 0.95)
   eq(d2["前文"], nil, "empty ctx removed after all keys pruned")
-  check(next(d2) == nil, "data fully empty")
+end
+
+do
+  local d = { ["前文"] = { ["词"] = 10 } }
+  local now = 1e9
+  local at = apply_time_decay(d, 0.95, nil, now, 86400)
+  eq(at, now, "first run stamps decay_at, no decay")
+  eq(d["前文"]["词"], 10, "no decay on first stamp")
+end
+
+do
+  local d = { ["前文"] = { ["词"] = 10 } }
+  local now = 1e9
+  local at = apply_time_decay(d, 0.95, now - 86400 * 2, now, 86400)
+  near(d["前文"]["词"], 10 * 0.95 * 0.95, 0.01, "two days → rate^2")
+  eq(at, now, "decay_at advanced by 2 periods")
+end
+
+do
+  local d = { ["前文"] = { ["词"] = 10 } }
+  local now = 1e9
+  local old = now - 3600
+  local at = apply_time_decay(d, 0.95, old, now, 86400)
+  eq(d["前文"]["词"], 10, "same day: no decay")
+  eq(at, old, "decay_at unchanged")
 end
 
 io.write("  passed\n")
 
 ----------------------------------------------------------------------
--- 4. score_candidates 基本评分
+-- 4. score_candidates
 ----------------------------------------------------------------------
 
 io.write("=== score_candidates ===\n")
@@ -183,15 +245,14 @@ do
     ["来的"]     = { ["任务"] = 2 },
     ["的"]       = { ["人物"] = 4 },
   }, s)
-  -- 精确前文 1.0: 任务 5, 工作 3
-  -- last-2-char 0.5 (来的): 任务 1
-  -- last-1-char 0.25 (的): 人物 1
+  -- 精确 1.0: 任务 5, 工作 3
+  -- last-2 0.5 (来的): 任务 +1
+  -- last-1 「的」是虚词，跳过，人物不得分
   near(s["任务"], 6.0, 0.01, "任务 score")
   near(s["工作"], 3.0, 0.01, "工作 score")
-  near(s["人物"], 1.0, 0.01, "人物 score")
+  eq(s["人物"], nil, "stopword suffix 的 does not score")
 end
 
--- 双词组合
 do
   local s = {}
   score_candidates(cands{"任务", "人物"}, {"完成", "接下来的"}, {
@@ -201,18 +262,26 @@ do
   near(s["任务"], 5 + 10 * 0.4, 0.01, "bigram score")
 end
 
--- 空窗口
 do
   local s = {}
   score_candidates(cands{"任务"}, {}, {}, s)
   eq(s["任务"], nil, "empty window => no scores")
 end
 
--- 空候选
 do
   local s = {}
   score_candidates({}, {"接下来的"}, {}, s)
   check(next(s) == nil, "no candidates => no scores")
+end
+
+do
+  -- 「好的」后不应被「的→朋友」带起
+  local s = {}
+  score_candidates(cands{"天气", "朋友"}, {"好的"}, {
+    ["的"] = { ["朋友"] = 8 },
+  }, s)
+  eq(s["朋友"], nil, "好的 does not inherit 的→朋友")
+  eq(s["天气"], nil)
 end
 
 io.write("  passed\n")
@@ -228,7 +297,6 @@ score_candidates(cands{"任务"}, {"接下来的"}, { ["接下来的"] = { ["任
 eq(s["旧数据"], nil, "old keys cleared")
 eq(s["任务"], 3.0, "new score set; table reused")
 
--- 再次复用
 score_candidates(cands{"工作"}, {"接下来的"}, { ["接下来的"] = { ["工作"] = 5 } }, s)
 eq(s["任务"], nil, "prev scores cleared on reuse")
 eq(s["工作"], 5.0, "new score after reuse")
@@ -241,18 +309,18 @@ io.write("  passed\n")
 
 io.write("=== multi-weight accumulation ===\n")
 
-local s = {}
+s = {}
 score_candidates(cands{"任务"}, {"接下来的"}, {
-  ["接下来的"] = { ["任务"] = 3 },  -- weight 1.0 => 3
-  ["来的"]     = { ["任务"] = 4 },  -- weight 0.5 => 2
-  ["的"]       = { ["任务"] = 8 },  -- weight 0.25 => 2
+  ["接下来的"] = { ["任务"] = 3 },  -- 1.0 => 3
+  ["来的"]     = { ["任务"] = 4 },  -- 0.5 => 2
+  ["的"]       = { ["任务"] = 8 },  -- skipped stopword
 }, s)
-near(s["任务"], 7.0, 0.01, "3 + 2 + 2 = 7")
+near(s["任务"], 5.0, 0.01, "3 + 2, 的 skipped")
 
 io.write("  passed\n")
 
 ----------------------------------------------------------------------
--- 7. load_data / save 往返
+-- 7. load_data / save 往返（新格式 + 旧格式）
 ----------------------------------------------------------------------
 
 io.write("=== load_data / save roundtrip ===\n")
@@ -262,50 +330,113 @@ local sample = {
   ["接下来的"] = { ["任务"] = 8, ["工作"] = 3 },
   ["完成"]     = { ["任务"] = 5 },
 }
-check(save(sample, tmp_file), "save succeeds")
-local loaded = load_data(tmp_file)
+check(save(sample, tmp_file, { decay_at = 42 }), "save succeeds")
+local loaded, meta = load_data(tmp_file)
 eq(loaded["接下来的"]["任务"], 8)
 eq(loaded["接下来的"]["工作"], 3)
 eq(loaded["完成"]["任务"], 5)
+eq(meta.decay_at, 42)
 os.remove(tmp_file)
 
--- 损坏文件应安全返回空表
+-- 旧扁平格式
+local old_file = os.tmpname()
+local of = io.open(old_file, "w")
+of:write('return {["完成"]={["任务"]=5}}\n')
+of:close()
+local old_loaded, old_meta = load_data(old_file)
+eq(old_loaded["完成"]["任务"], 5, "legacy format")
+check(old_meta.decay_at == nil, "legacy has no decay_at")
+os.remove(old_file)
+
 local bad_file = os.tmpname()
 local bf = io.open(bad_file, "w")
 bf:write("not valid lua!!!")
 bf:close()
-check(next(load_data(bad_file)) == nil, "corrupt file => empty table")
+local bad_data = load_data(bad_file)
+check(next(bad_data) == nil, "corrupt file => empty table")
 os.remove(bad_file)
 
 io.write("  passed\n")
 
 ----------------------------------------------------------------------
--- 8. 学习计数不重复累加
+-- 8. 分段学习：select 粒度，整句不上窗
 ----------------------------------------------------------------------
 
-io.write("=== learning count (no double-count) ===\n")
+io.write("=== on_select / on_commit (segment learning) ===\n")
 
 do
-  local learned = {}
-  for _ = 1, 5 do
-    local prev, text = "接下来的", "任务"
-    local e = learned[prev]
-    if e then
-      e[text] = (e[text] or 0) + 1
-    else
-      learned[prev] = { [text] = 1 }
-    end
-  end
-  eq(learned["接下来的"]["任务"], 5, "5 commits => count 5, not 10")
+  local env = new_env()
+  on_select(env, "接下来的")
+  on_select(env, "任务")
+  eq(env.window[1], "接下来的", "window updates on select for next-segment scoring")
+  eq(env.window[2], "任务")
+  check(next(env.learned) == nil, "learning deferred until commit")
+  on_commit(env, "接下来的任务")
+  eq(env.learned["接下来的"]["任务"], 1, "commit flushes word pair")
+  eq(env.learned["任务"], nil, "whole sentence not used as next key")
+  eq(env.commit_count, 1)
+end
+
+do
+  local env = new_env()
+  on_select(env, "接下来的任务是完成报告")
+  check(next(env.learned) == nil, "long sentence not learned")
+  eq(#env.window, 0, "long sentence not pushed to window")
+  on_commit(env, "接下来的任务是完成报告")
+  check(next(env.learned) == nil, "long sentence still not learned on commit")
+end
+
+do
+  local env = new_env()
+  on_select(env, "完成")
+  on_select(env, "的")
+  on_select(env, "任务")
+  on_commit(env, "完成的任务")
+  eq(env.learned["的"], nil, "stopword 的 is not a key")
+  eq(env.learned["完成"]["任务"], 1, "window skips 的, learns 完成→任务")
+  eq(env.window[#env.window], "任务")
+end
+
+do
+  local env = new_env()
+  on_select(env, "完成")
+  on_select(env, "任务")
+  on_cancel(env)
+  check(next(env.learned) == nil, "Esc does not learn")
+  eq(#env.window, 0, "Esc rolls window back")
+end
+
+do
+  local env = new_env()
+  on_commit(env, "完成")
+  on_select(env, "任务")
+  on_cancel(env)
+  eq(env.window[1], "完成", "Esc restores pre-composition window")
+  eq(env.learned["完成"], nil, "cancelled 任务 not learned")
+end
+
+do
+  local env = new_env()
+  on_commit(env, "完成")  -- 无 select（例如直接上屏）
+  on_commit(env, "任务")
+  eq(env.learned["完成"]["任务"], 1, "commit-only still learns when tokens are words")
+end
+
+do
+  local env = new_env()
+  on_select(env, "完成")
+  on_commit(env, "。")
+  eq(#env.window, 1, "punct commit after select does not replace window")
+  eq(env.window[1], "完成")
 end
 
 io.write("  passed\n")
 
 ----------------------------------------------------------------------
--- 9. do_save 刷盘与衰减
+-- 9. do_save 按日衰减
 ----------------------------------------------------------------------
 
-io.write("=== do_save ===\n")
+io.write("=== do_save time decay ===\n")
 
 do
   local tmp = os.tmpname()
@@ -314,13 +445,14 @@ do
     data_file = tmp,
     decay_enabled = true,
     decay_rate = 0.95,
+    decay_period = 86400,
+    decay_at = os.time() - 86400,
     commit_count = 3,
   }
-  do_save(env, true)
+  do_save(env)
   eq(env.commit_count, 0, "commit_count reset after save")
   local reloaded = load_data(tmp)
-  near(reloaded["前文"]["词"], 9.5, 0.01, "decay applied on periodic save")
-  eq(reloaded["前文"]["将消亡"], nil, "low count pruned by decay before serialize")
+  near(reloaded["前文"]["词"], 9.5, 0.01, "one day decay on save")
   os.remove(tmp)
 end
 
@@ -331,14 +463,54 @@ do
     data_file = tmp,
     decay_enabled = true,
     decay_rate = 0.95,
+    decay_period = 86400,
+    decay_at = os.time(),
     commit_count = 2,
   }
-  do_save(env, false)
+  do_save(env)
   local reloaded = load_data(tmp)
-  eq(reloaded["前文"]["词"], 10, "fini flush skips decay")
+  eq(reloaded["前文"]["词"], 10, "same-day save skips decay")
   os.remove(tmp)
 end
 
+io.write("  passed\n")
+
+----------------------------------------------------------------------
+-- 10. reorder_batch：只提前，不整表打乱
+----------------------------------------------------------------------
+
+io.write("=== reorder_batch ===\n")
+
+do
+  local batch = cands{"人物", "任务", "工作", "任命"}
+  local scores = { ["任务"] = 5, ["工作"] = 3 }
+  local out, changed = reorder_batch(batch, scores, 2.0)
+  check(changed, "reordered")
+  eq(out[1].text, "任务", "highest first")
+  eq(out[2].text, "工作", "second promoted")
+  eq(out[3].text, "人物", "unscored keep original relative order")
+  eq(out[4].text, "任命")
+end
+
+do
+  local batch = cands{"人物", "任务"}
+  local out, changed = reorder_batch(batch, { ["任务"] = 1.5 }, 2.0)
+  check(not changed, "below threshold")
+  eq(out[1].text, "人物", "original order preserved")
+  eq(out[2].text, "任务")
+end
+
+io.write("  passed\n")
+
+----------------------------------------------------------------------
+-- 11. resolve_data_path
+----------------------------------------------------------------------
+
+io.write("=== resolve_data_path ===\n")
+eq(resolve_data_path("/custom/x.data", "/user"), "/custom/x.data", "custom wins")
+local sep = package.config:sub(1, 1)
+eq(resolve_data_path("", "/home/u/rime"), "/home/u/rime" .. sep .. "context_learned.data")
+eq(resolve_data_path(nil, "/home/u/rime/"), "/home/u/rime/context_learned.data", "trailing slash")
 io.write("  passed\n")
 
 ----------------------------------------------------------------------

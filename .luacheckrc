@@ -1,5 +1,6 @@
 globals = {
   "yield",
+  "rime_api",
 }
 
 ignore = {
