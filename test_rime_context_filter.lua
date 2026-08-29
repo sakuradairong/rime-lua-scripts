@@ -34,6 +34,8 @@ local revert_last_select = rcf.revert_last_select
 local sync_pending       = rcf.sync_pending
 local do_save            = rcf.do_save
 local resolve_data_path  = rcf.resolve_data_path
+local init               = rcf.init
+local filter             = rcf.func
 
 ----------------------------------------------------------------------
 -- Assertion helpers
@@ -572,7 +574,73 @@ end
 io.write("  passed\n")
 
 ----------------------------------------------------------------------
--- 11. resolve_data_path
+-- 11. notifier 优先级 / filter 配置边界
+----------------------------------------------------------------------
+
+io.write("=== notifier priority / filter limits ===\n")
+
+do
+  local tmp = os.tmpname()
+  os.remove(tmp)
+  local groups = {}
+  local function notifier(name)
+    return {
+      connect = function(_, _, group)
+        groups[name] = group
+        return { disconnect = function() end }
+      end,
+    }
+  end
+  local config = {
+    get_string = function(_, key)
+      if key:match("/data_path$") then return tmp end
+      return nil
+    end,
+    get_int = function() return nil end,
+    get_bool = function() return nil end,
+    get_double = function() return nil end,
+  }
+  local env = {
+    name_space = "*rime_context_filter",
+    engine = {
+      schema = { config = config },
+      context = {
+        select_notifier = notifier("select"),
+        commit_notifier = notifier("commit"),
+        update_notifier = notifier("update"),
+      },
+    },
+  }
+  init(env)
+  eq(groups.select, 0, "select callback runs before engine advances composition")
+  os.remove(tmp)
+end
+
+do
+  local input = {
+    iter = function()
+      local values = cands{"人物", "任务"}
+      local i = 0
+      return function()
+        i = i + 1
+        return values[i]
+      end, nil, nil
+    end,
+  }
+  local out = {}
+  local old_yield = _G.yield
+  _G.yield = function(c) out[#out + 1] = c end
+  filter(input, { reorder_limit = 0, window = {}, learned = {}, scores = {} })
+  _G.yield = old_yield
+  eq(#out, 2, "zero reorder_limit passes all candidates through")
+  eq(out[1].text, "人物")
+  eq(out[2].text, "任务")
+end
+
+io.write("  passed\n")
+
+----------------------------------------------------------------------
+-- 12. resolve_data_path
 ----------------------------------------------------------------------
 
 io.write("=== resolve_data_path ===\n")

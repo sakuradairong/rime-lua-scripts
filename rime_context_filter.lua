@@ -657,12 +657,13 @@ local function init(env)
   local ctx = env.engine.context
 
   -- 必须持有 connection，否则 GC 会断开回调
+  -- group 0 先于未分组的引擎回调执行，避免 composition 推进后丢失刚选中的词。
   env.select_conn = ctx.select_notifier:connect(function(c)
     local ok, text = pcall(selected_text, c)
     if ok and text then
       on_select(env, text, get_confirmed_pos(c))
     end
-  end)
+  end, 0)
 
   env.commit_conn = ctx.commit_notifier:connect(function(c)
     env._in_commit = true
@@ -716,6 +717,15 @@ local function filter(input, env)
   local function next_cand()
     var = iter_fn(inv, var)
     return var
+  end
+
+  if limit <= 0 then
+    local cand = next_cand()
+    while cand do
+      yield(cand)
+      cand = next_cand()
+    end
+    return
   end
 
   local batch = {}
