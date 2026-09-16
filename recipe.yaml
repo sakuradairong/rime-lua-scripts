@@ -1,0 +1,8 @@
+# encoding: utf-8
+---
+recipe:
+  Rx: all
+  description: >-
+    个人 Rime Lua 脚本合集
+install_files: >-
+  lua/*.*

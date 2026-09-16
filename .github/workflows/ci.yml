@@ -19,7 +19,7 @@ jobs:
       - name: Install luacheck
         run: sudo luarocks install luacheck
       - name: Lint
-        run: luacheck rime_context_filter.lua --no-max-line-length
+        run: luacheck lua tests --no-max-line-length
 
   test:
     name: Test (Lua 5.3)
@@ -29,7 +29,12 @@ jobs:
       - name: Install Lua
         run: sudo apt-get update -qq && sudo apt-get install -y -qq lua5.3
       - name: Run tests
-        run: lua5.3 test_rime_context_filter.lua
+        run: |
+          set -e
+          for f in tests/test_*.lua; do
+            echo "==> $f"
+            lua5.3 "$f"
+          done
 
   test-luajit:
     name: Test (LuaJIT)
@@ -39,7 +44,12 @@ jobs:
       - name: Install LuaJIT
         run: sudo apt-get update -qq && sudo apt-get install -y -qq luajit
       - name: Run tests
-        run: luajit test_rime_context_filter.lua
+        run: |
+          set -e
+          for f in tests/test_*.lua; do
+            echo "==> $f"
+            luajit "$f"
+          done
 
   test-lua51:
     name: Test (Lua 5.1)
@@ -51,4 +61,9 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq lua5.1
       - name: Run tests
-        run: lua5.1 test_rime_context_filter.lua
+        run: |
+          set -e
+          for f in tests/test_*.lua; do
+            echo "==> $f"
+            lua5.1 "$f"
+          done

@@ -1,10 +1,12 @@
 -- test_rime_context_filter.lua
 -- 纯 Lua 单元测试（零外部依赖）
--- 运行: lua test_rime_context_filter.lua
+-- 运行: lua tests/test_rime_context_filter.lua
 
-local mod, err_msg = loadfile("rime_context_filter.lua")
+local testdir = (arg[0] or ""):match("^(.*)[/\\]") or "."
+local lua_file = testdir .. "/../lua/rime_context_filter.lua"
+local mod, err_msg = loadfile(lua_file)
 if not mod then
-  io.stderr:write("FATAL: Could not load rime_context_filter.lua: " .. tostring(err_msg) .. "\n")
+  io.stderr:write("FATAL: Could not load " .. lua_file .. ": " .. tostring(err_msg) .. "\n")
   os.exit(1)
 end
 local ok, rcf = pcall(mod)
